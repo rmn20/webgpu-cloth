@@ -16,7 +16,6 @@ struct Uniforms {
 @group(0) @binding(4) var<storage, read_write> accBuffer: array<atomic<i32>>;
 
 const GRID_SIZE: u32 = 64;
-const FP_PRECISION: f32 = 1 << 24; //no atomic floats in webgpu
 
 fn readInputVtx(idx: u32) -> vec3f {
 	return vec3f(
@@ -32,6 +31,16 @@ fn readOutputVtx(idx: u32) -> vec3f {
 		vertsOut[idx * 3 + 1],
 		vertsOut[idx * 3 + 2]
 	);
+}
+
+const FP_PRECISION: f32 = 1 << 24; //no atomic floats in webgpu
+
+fn readAccumCorrection(idx: u32) -> vec3f {
+	return vec3f(vec3i(
+		atomicLoad(&accBuffer[idx * 3    ]),
+		atomicLoad(&accBuffer[idx * 3 + 1]),
+		atomicLoad(&accBuffer[idx * 3 + 2])
+	)) / FP_PRECISION;
 }
 
 fn isPointPinned(vtx: vec2u) -> bool {
@@ -105,7 +114,6 @@ fn resolveContraints(
 	//Iterate over all connected UNPROCESSED springs
 	// and accumulate corrections
 	var vtx: vec3f = readOutputVtx(vtxIdx);
-	var corrAccum: vec3i = vec3i(0);
 	
 	const springLen: f32 = 1 / f32(GRID_SIZE - 1);
 	
@@ -138,8 +146,12 @@ fn resolveContraints(
 			var neighIdx: u32 = u32(vtxPosi.x + dx + (vtxPosi.y + dz) * i32(GRID_SIZE));
 			var neighVtx: vec3f = readOutputVtx(neighIdx);
 			
+			//Use updated positions
+			var vtxTmp: vec3f = vtx + readAccumCorrection(vtxIdx);
+			neighVtx += readAccumCorrection(neighIdx);
+			
 			//Calculate correction force from spring
-			var dir: vec3f = neighVtx - vtx;
+			var dir: vec3f = neighVtx - vtxTmp;
 			
 			var targetLen: f32 = springLen * scale;
 			var currentLen: f32 = length(dir);
@@ -147,7 +159,6 @@ fn resolveContraints(
 			
 			var compliance: f32 = 0.000005 * scale;
 			var stiffness: f32 = 1 / (1 + compliance / uniforms.deltaTime / uniforms.deltaTime);
-			stiffness = min(0.2, stiffness); //cloth explodes if stiffness > 0.2
 			
 			var correctionForce: f32 = (currentLen - targetLen) * stiffness * 0.5f / currentLen;
 			//float constraint = currentLen - targetLen;
@@ -167,17 +178,15 @@ fn resolveContraints(
 			}
 			
 			//Add correction force to accumulation buffer
-			corrAccum += corrForce;
+			atomicAdd(&accBuffer[vtxIdx * 3    ], corrForce.x);
+			atomicAdd(&accBuffer[vtxIdx * 3 + 1], corrForce.y);
+			atomicAdd(&accBuffer[vtxIdx * 3 + 2], corrForce.z);
 			
 			atomicAdd(&accBuffer[neighIdx * 3    ], corrForceInv.x);
 			atomicAdd(&accBuffer[neighIdx * 3 + 1], corrForceInv.y);
 			atomicAdd(&accBuffer[neighIdx * 3 + 2], corrForceInv.z);
 		}
 	}
-	
-	atomicAdd(&accBuffer[vtxIdx * 3    ], corrAccum.x);
-	atomicAdd(&accBuffer[vtxIdx * 3 + 1], corrAccum.y);
-	atomicAdd(&accBuffer[vtxIdx * 3 + 2], corrAccum.z);
 }
 
 @compute @workgroup_size(8, 8)
@@ -188,11 +197,7 @@ fn updateBuffers(
 	// and reset buffer
 	var vtxIdx: u32 = vtxPos.y * GRID_SIZE + vtxPos.x;
 	
-	var force: vec3f = vec3f(vec3i(
-		atomicLoad(&accBuffer[vtxIdx * 3    ]),
-		atomicLoad(&accBuffer[vtxIdx * 3 + 1]),
-		atomicLoad(&accBuffer[vtxIdx * 3 + 2])
-	)) / FP_PRECISION;
+	var force: vec3f = readAccumCorrection(vtxIdx);
 	
 	atomicStore(&accBuffer[vtxIdx * 3    ], 0);
 	atomicStore(&accBuffer[vtxIdx * 3 + 1], 0);
