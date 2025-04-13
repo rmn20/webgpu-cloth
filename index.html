@@ -14,8 +14,27 @@
 			Shift - замедление полёта<br>
 			ЛКМ + мышь - вращение камеры<br>
 			<br>
+			
+			<label for="stretchstiff">Stretch stiffness:</label>
+			<input id="stretchstiff" type="range" min="1" max="200" step="any" value="100"/>
+			<br>
+			
+			<label for="bendstiff">Bend stiffness:</label>
+			<input id="bendstiff" type="range" min="1" max="200" step="any" value="100"/>
+			<br>
+			
+			<label for="gravity">Включить гравитацию:</label>
 			<input type="checkbox" id="gravity" checked/>
-			<label for="gravity">Включить гравитацию</label><br>
+			<br>
+			
+			<label for="pinpoint5">Закрепить точки:</label>
+			<input type="checkbox" id="pinpoint1" checked/>
+			<input type="checkbox" id="pinpoint2" checked/>
+			<input type="checkbox" id="pinpoint3" checked/>
+			<input type="checkbox" id="pinpoint4" checked/>
+			<input type="checkbox" id="pinpoint5" checked/>
+			<br>
+			
 			<div id="dtime"></div>
 		</div>
 	
@@ -33,6 +52,7 @@
 			canvas.height = window.innerHeight;
 			
 			//Mouse controls
+
 			let mousePos = {x: 0, y: 0};
 			let prevMousePos = {x: 0, y: 0};
 
@@ -43,7 +63,10 @@
 			
 			let mouseDown = false;
 
-			onmousedown = function(e) {
+			canvas.addEventListener('mousedown', (e) => {
+				e.preventDefault(); //cancel selection
+				e.stopPropagation();
+					
 				mousePos.x = e.clientX;
 				mousePos.y = e.clientY; 
 				
@@ -51,7 +74,7 @@
 				prevMousePos.y = mousePos.y;
 				
 				mouseDown = true;
-			}
+			});
 			
 			onmouseup = function(e) { mouseDown = false; }
 			
@@ -293,12 +316,16 @@
 			});
 			
 			//time, prevDeltaTime, deltaTime, gravity
-			const physUniformArray = new Float32Array(4);
-			const physUniformBuffer = device.createBuffer({
+			//stretch confliance, bend confliance, padding 2x
+			const physUniArray = new Float32Array(8);
+			const physUniBuffer = device.createBuffer({
 				label: "Physics uniforms",
 				size: uniformArray.byteLength,
 				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
 			});
+			
+			//int view for bitmask
+			const physUniArrayInt = new Uint32Array(physUniArray.buffer)
 			
 			//Create two bind groups with different sets of vtx buffers
 			const physBindGroupTemplate = {
@@ -306,7 +333,7 @@
 				layout: physBindGroupLayout,
 				entries: [{
 					binding: 0,
-					resource: {buffer: physUniformBuffer}
+					resource: {buffer: physUniBuffer}
 				}, {
 					binding: 1,
 					resource: {buffer: vtxBuffer}
@@ -512,31 +539,40 @@
 				let gravity = document.getElementById("gravity").checked ? 9.8 : 0;
 				
 				//Fill compute uniforms with initial data
-				physUniformArray[0] = timestamp / 1000 - (PHYS_STEPS - 1) * deltaTime / PHYS_STEPS;
-				physUniformArray[1] = prevDeltaTime / PHYS_STEPS;
-				physUniformArray[2] = deltaTime / PHYS_STEPS;
-				physUniformArray[3] = gravity;
+				physUniArray[0] = timestamp / 1000 - (PHYS_STEPS - 1) * deltaTime / PHYS_STEPS;
+				physUniArray[1] = prevDeltaTime / PHYS_STEPS;
+				physUniArray[2] = deltaTime / PHYS_STEPS;
+				physUniArray[3] = gravity;
+				
+				physUniArray[4] = 0.0005 / document.getElementById("stretchstiff").value;
+				physUniArray[5] = 0.0005 / document.getElementById("bendstiff").value;
+				physUniArrayInt[6] = 
+					(document.getElementById("pinpoint1").checked ? 1 : 0) |
+					(document.getElementById("pinpoint2").checked ? 2 : 0) |
+					(document.getElementById("pinpoint3").checked ? 4 : 0) |
+					(document.getElementById("pinpoint4").checked ? 8 : 0) |
+					(document.getElementById("pinpoint5").checked ? 16 : 0);
 					
 				device.queue.writeBuffer(
-					physUniformBuffer,
+					physUniBuffer,
 					0,
-					physUniformArray.buffer,
-					physUniformArray.byteOffset,
-					physUniformArray.byteLength
+					physUniArray.buffer,
+					physUniArray.byteOffset,
+					physUniArray.byteLength
 				);
 				
 				for(let i = 0; i < PHYS_STEPS; i++) {
 					if(i > 0) {
 						//Update time uniform
-						physUniformArray[0] += deltaTime / PHYS_STEPS;
+						physUniArray[0] += deltaTime / PHYS_STEPS;
 						//Replace prev delta time at second step
-						physUniformArray[1] = physUniformArray[2];
+						physUniArray[1] = physUniArray[2];
 						
 						device.queue.writeBuffer(
-							physUniformBuffer,
+							physUniBuffer,
 							0,
-							physUniformArray.buffer,
-							physUniformArray.byteOffset,
+							physUniArray.buffer,
+							physUniArray.byteOffset,
 							(i == 1) ? 4 * 2 : 4
 						);
 					}
