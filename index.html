@@ -1,0 +1,651 @@
+<!doctype html>
+
+<html>
+	<head>
+		<meta charset="utf-8">
+		<title>WebGPU PBD Cloth</title>
+	</head>
+	<body style="margin: 0;">
+		<canvas style="position: absolute"></canvas>
+		
+		<div id="overlay" style="margin: 8px; position: absolute">
+			Controls:<br>
+			WASD - fly<br>
+			Shift - slow down<br>
+			LMB + mouse - camera rotation<br>
+			<br>
+			
+			<label for="stretchstiff">Stretch stiffness:</label>
+			<input id="stretchstiff" type="range" min="100" max="1000" step="any" value="200"/>
+			<br>
+			
+			<label for="bendstiff">Bend stiffness:</label>
+			<input id="bendstiff" type="range" min="1" max="200" step="any" value="100"/>
+			<br>
+			
+			<label for="gravity">Enable gravity:</label>
+			<input type="checkbox" id="gravity" checked/>
+			<br>
+			
+			<label for="pinpoint1">Pin points:</label>
+			<input type="checkbox" id="pinpoint1" checked/>
+			<input type="checkbox" id="pinpoint2" checked/>
+			<input type="checkbox" id="pinpoint3" checked/>
+			<input type="checkbox" id="pinpoint4" checked/>
+			<input type="checkbox" id="pinpoint5" checked/>
+			<br>
+			
+			<div id="dtime"></div>
+		</div>
+	
+		<script src="wgpu-matrix.js"></script>
+		<script src="render.wgsl"></script>
+		<script src="physics.wgsl"></script>
+		
+		<script type="module">
+			const { mat4, vec3 } = wgpuMatrix;
+			
+			//Prepare canvas and controls
+			const canvas = document.querySelector("canvas");
+			
+			canvas.width = window.innerWidth;
+			canvas.height = window.innerHeight;
+			
+			//Mouse controls
+
+			let mousePos = {x: 0, y: 0};
+			let prevMousePos = {x: 0, y: 0};
+
+			onmousemove = function(e) {
+				mousePos.x = e.clientX;
+				mousePos.y = e.clientY;
+			}
+			
+			let mouseDown = false;
+
+			canvas.addEventListener('mousedown', (e) => {
+				e.preventDefault(); //cancel selection
+				e.stopPropagation();
+					
+				mousePos.x = e.clientX;
+				mousePos.y = e.clientY; 
+				
+				prevMousePos.x = mousePos.x;
+				prevMousePos.y = mousePos.y;
+				
+				mouseDown = true;
+			});
+			
+			onmouseup = function(e) { mouseDown = false; }
+			
+			//Keyboard controls
+			const KEY_W = "W".charCodeAt(0);
+			const KEY_A = "A".charCodeAt(0);
+			const KEY_S = "S".charCodeAt(0);
+			const KEY_D = "D".charCodeAt(0);
+			const KEY_SHIFT = 16;
+			
+			const usedKeysList = [KEY_W, KEY_A, KEY_S, KEY_D, KEY_SHIFT]
+			
+			let pressedKeys = {};
+			 
+			onkeydown = function(e) {
+				if(usedKeysList.includes(e.keyCode)) {
+					e.preventDefault();
+					e.stopPropagation();
+				}
+				
+				pressedKeys[e.keyCode] = true;
+			}
+			
+			onkeyup = function(e) { pressedKeys[e.keyCode] = false; }
+
+			//WebGPU device initialization
+			if (!navigator.gpu) {
+				let error = "WebGPU not supported on this browser.";
+				
+				document.getElementById("overlay").innerHTML = error
+				throw new Error(error);
+			}
+			
+			const adapter = await navigator.gpu.requestAdapter();
+			if (!adapter) {
+				let error = "No appropriate GPUAdapter found.";
+				
+				document.getElementById("overlay").innerHTML = error
+				throw new Error(error);
+			}
+
+			const device = await adapter.requestDevice();
+
+			//Canvas context configuration
+			const context = canvas.getContext("webgpu");
+			const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+		
+			context.configure({
+					device: device,
+					format: canvasFormat,
+			});
+
+			//Create buffers for rendering
+			const GRID_SIZE = 64;
+			const vtxArray = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+		
+			for(let z = 0, i = 0; z < GRID_SIZE; z++) {
+				for(let x = 0; x < GRID_SIZE; x++, i++) {
+					vtxArray[i * 3 + 0] = x / (GRID_SIZE - 1);
+					vtxArray[i * 3 + 2] = z / (GRID_SIZE - 1);
+				}
+			}
+		
+			const vtxBuffer = device.createBuffer({
+				label: "Cloth verts 1",
+				size: vtxArray.byteLength,
+				usage: 
+					GPUBufferUsage.VERTEX | 
+					GPUBufferUsage.STORAGE | 
+					GPUBufferUsage.COPY_DST
+			});
+		
+			const vtxBufferNext = device.createBuffer({
+				label: "Cloth verts 2",
+				size: vtxArray.byteLength,
+				usage: 
+					GPUBufferUsage.VERTEX | 
+					GPUBufferUsage.STORAGE | 
+					GPUBufferUsage.COPY_DST
+			});
+		
+			device.queue.writeBuffer(vtxBuffer, 0, vtxArray);
+			device.queue.writeBuffer(vtxBufferNext, 0, vtxArray);
+			
+			//Indices
+			const indexArray = new Uint16Array((GRID_SIZE - 1) * (GRID_SIZE - 1) * 2 * 3);
+			
+			for(let z = 0, i = 0; z < GRID_SIZE - 1; z++) {
+				for(let x = 0; x < GRID_SIZE - 1; x++, i++) {
+					let idx = z * GRID_SIZE + x;
+					
+					indexArray[i * 6 + 0] = idx;
+					indexArray[i * 6 + 1] = idx + GRID_SIZE + 1; //+x+z
+					indexArray[i * 6 + 2] = idx + 1; //+x
+					
+					indexArray[i * 6 + 3] = idx; //+x
+					indexArray[i * 6 + 4] = idx + GRID_SIZE; //+z
+					indexArray[i * 6 + 5] = idx + GRID_SIZE + 1; //+z+x
+				}
+			}
+		
+			const indexBuffer = device.createBuffer({
+				label: "Cloth vtx indices",
+				size: indexArray.byteLength,
+				usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+			});
+		
+			device.queue.writeBuffer(indexBuffer, 0, indexArray);
+		
+			//Normals
+			const normsBuffer = device.createBuffer({
+				label: "Cloth normals",
+				size: vtxArray.byteLength,
+				usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE,
+			});
+
+			//Create bind groups, uniforms, shaders, pipelines for rendering
+			const renderBindGroupLayout = device.createBindGroupLayout({
+				label: "Render bind group layout",
+				entries: [{
+					binding: 0,
+					visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+					buffer: {type: "uniform"} //viewMat, projMat, viewPos
+				}]
+			});
+
+			const renderPipelineLayout = device.createPipelineLayout({
+				label: "Render pipeline layout",
+				bindGroupLayouts: [renderBindGroupLayout],
+			});
+			
+			//viewMat, projMat, viewPos
+			const uniformArray = new Float32Array(16 + 16 + 4);
+			const uniformBuffer = device.createBuffer({
+				label: "Render uniforms",
+				size: uniformArray.byteLength,
+				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+			});
+			
+			const renderBindGroup = device.createBindGroup({
+				label: "Render bind group",
+				layout: renderBindGroupLayout,
+				entries: [{
+					binding: 0,
+					resource: {buffer: uniformBuffer}
+				}]
+			});
+
+			const renderShaderModule = device.createShaderModule({
+				label: "Render shader",
+				code: renderShaderCode
+			});
+
+			const renderPipeline = device.createRenderPipeline({
+				label: "Render pipeline",
+				layout: renderPipelineLayout,
+				
+				vertex: {
+					module: renderShaderModule,
+					entryPoint: "vertexMain",
+					buffers: [{
+						arrayStride: 12,
+						attributes: [{
+							format: "float32x3",
+							offset: 0,
+							shaderLocation: 0, //Position
+						}]
+					}, {
+						arrayStride: 12,
+						attributes: [{
+							format: "float32x3",
+							offset: 0,
+							shaderLocation: 1, //Normal
+						}]
+					}]
+				},
+				
+				fragment: {
+					module: renderShaderModule,
+					entryPoint: "fragmentMain",
+					targets: [{
+						format: canvasFormat
+					}]
+				},
+				
+				primitive: {
+					topology: "triangle-list",
+					cullMode: "none",
+				},
+				
+				multisample: {
+					count: 4,
+				},
+
+				depthStencil: {
+					depthWriteEnabled: true,
+					depthCompare: "less-equal",
+					format: "depth24plus",
+				},
+			});
+			
+			//Create bind groups, uniforms, shaders, pipelines for physics compute
+			
+			//Constraints corrections accumulation buffer
+			const accBuffer = device.createBuffer({
+				label: "Accumulation buffer",
+				size: vtxArray.byteLength,
+				usage: GPUBufferUsage.STORAGE,
+			});
+			
+			const physBindGroupLayout = device.createBindGroupLayout({
+				label: "Physics bind group layout",
+				entries: [{
+					binding: 0,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: {type: "uniform"} //time, prevDeltaTime, deltaTime, gravity
+				}, {
+					binding: 1,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: {type: "read-only-storage"} //previous vertices
+				}, {
+					binding: 2,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: {type: "storage"} //new vertices
+				}, {
+					binding: 3,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: {type: "storage"} //normals
+				}, {
+					binding: 4,
+					visibility: GPUShaderStage.COMPUTE,
+					buffer: {type: "storage"} //accumulation buffer
+				}]
+			});
+
+			const physPipelineLayout = device.createPipelineLayout({
+				label: "Physics pipeline layout",
+				bindGroupLayouts: [physBindGroupLayout],
+			});
+			
+			//time, prevDeltaTime, deltaTime, gravity
+			//stretch confliance, bend confliance, padding 2x
+			const physUniArray = new Float32Array(8);
+			const physUniBuffer = device.createBuffer({
+				label: "Physics uniforms",
+				size: uniformArray.byteLength,
+				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+			});
+			
+			//int view for bitmask
+			const physUniArrayInt = new Uint32Array(physUniArray.buffer)
+			
+			//Create two bind groups with different sets of vtx buffers
+			const physBindGroupTemplate = {
+				label: "Physics bind group",
+				layout: physBindGroupLayout,
+				entries: [{
+					binding: 0,
+					resource: {buffer: physUniBuffer}
+				}, {
+					binding: 1,
+					resource: {buffer: vtxBuffer}
+				}, {
+					binding: 2,
+					resource: {buffer: vtxBufferNext}
+				}, {
+					binding: 3,
+					resource: {buffer: normsBuffer}
+				}, {
+					binding: 4,
+					resource: {buffer: accBuffer}
+				}]
+			};
+			
+			const physBindGroups = new Array(2);
+			
+			physBindGroups[0] = device.createBindGroup(physBindGroupTemplate);
+			
+			physBindGroupTemplate.entries[1].resource.buffer = vtxBufferNext;
+			physBindGroupTemplate.entries[2].resource.buffer = vtxBuffer;
+			
+			physBindGroups[1] = device.createBindGroup(physBindGroupTemplate);
+
+			//Create all compute pipelines for physics
+			const physicsShaderModule = device.createShaderModule({
+				label: "Physics shader",
+				code: physicsShaderCode
+			});
+			
+			const physAddForcesPipeline = device.createComputePipeline({
+				label: "Physics add forces pipeline",
+				layout: physPipelineLayout,
+				compute: {
+					module: physicsShaderModule,
+					entryPoint: "addForces",
+				}
+			});
+			
+			const physResolveConstraintsPipeline = device.createComputePipeline({
+				label: "Physics resolve constraints pipeline",
+				layout: physPipelineLayout,
+				compute: {
+					module: physicsShaderModule,
+					entryPoint: "resolveContraints",
+				}
+			});
+			
+			const physUpdateBuffersPipeline = device.createComputePipeline({
+				label: "Physics update buffers pipeline",
+				layout: physPipelineLayout,
+				compute: {
+					module: physicsShaderModule,
+					entryPoint: "updateBuffers",
+				}
+			});
+			
+			const recalcNormsPipeline = device.createComputePipeline({
+				label: "Recalculate normals pipeline",
+				layout: physPipelineLayout,
+				compute: {
+					module: physicsShaderModule,
+					entryPoint: "recalcNorms",
+				}
+			});
+			
+			//Prepare render targets and start rendering
+			function createDepthTexture() {
+				return device.createTexture({
+					size: [canvas.width, canvas.height],
+					sampleCount: 4,
+					format: 'depth24plus',
+					usage: GPUTextureUsage.RENDER_ATTACHMENT,
+				});
+			}
+			
+			function createRenderTexture() {
+				return device.createTexture({
+					size: [canvas.width, canvas.height],
+					sampleCount: 4,
+					format: canvasFormat,
+					usage: GPUTextureUsage.RENDER_ATTACHMENT,
+				});
+			}
+			
+			let renderTexture = createRenderTexture();
+			let depthTexture = createDepthTexture();
+			
+			let projMat = mat4.create();
+			let viewMat = mat4.create();
+			let invViewMat = mat4.create();
+			
+			let camPos = vec3.create(1.5, 0.5, -0.5);
+			let camRot = vec3.create(-20, 135, 0);
+			let tmpMoveVec = vec3.create();
+			
+			let deltaTime = 1 / 60, prevDeltaTime = 1 / 60;
+			let lastTimestamp = 0;
+			
+			let step = 0; //Used to swap vertex buffers
+
+			function frame(timestamp) {
+				//Update delta time
+				if(lastTimestamp != 0) {
+					prevDeltaTime = deltaTime;
+					let tmpDelta = (timestamp - lastTimestamp) / 1000;
+					
+					//Simulation was probably interrupted by browser
+					// if delta is too big or too low
+					if(tmpDelta > 1 / 1000 && tmpDelta < 1 / 10) {
+						deltaTime = tmpDelta;
+						
+						document.getElementById("dtime").innerHTML = 
+							"Frame time: " + Math.round(deltaTime * 10000) / 10
+					}
+				}
+				
+				lastTimestamp = timestamp;
+			
+				//Update canvas size to fit window
+				if(canvas.width != window.innerWidth || canvas.height != window.innerHeight) {
+					canvas.width = window.innerWidth;
+					canvas.height = window.innerHeight;
+					
+					renderTexture.destroy();
+					renderTexture = createRenderTexture();
+					
+					depthTexture.destroy();
+					depthTexture = createDepthTexture();
+				}
+				
+				//Camera rotation
+				if(mouseDown) {
+					camRot[0] -= (mousePos.y - prevMousePos.y) / canvas.height * 90;
+					camRot[1] -= (mousePos.x - prevMousePos.x) / canvas.height * 90;
+					
+					if(camRot[0] < -89) camRot[0] = -89;
+					if(camRot[0] > 89) camRot[0] = 89;
+				}
+				
+				prevMousePos.x = mousePos.x;
+				prevMousePos.y = mousePos.y;
+				
+				//Camera movement
+				vec3.set(0, 0, 0, tmpMoveVec);
+		
+				if(pressedKeys[KEY_W]) tmpMoveVec[2] -= 1;
+				if(pressedKeys[KEY_S]) tmpMoveVec[2] += 1;
+				if(pressedKeys[KEY_A]) tmpMoveVec[0] -= 1;
+				if(pressedKeys[KEY_D]) tmpMoveVec[0] += 1;
+				
+				if(tmpMoveVec[0] != 0 || tmpMoveVec[2] != 0) {
+					//let speed = 0.05 * (pressedKeys[KEY_SHIFT] ? 3 : 1) / (pressedKeys[KEY_CONTROL] ? 3 : 1);
+					let speed = 0.05 / (pressedKeys[KEY_SHIFT] ? 3 : 1);
+					speed *= deltaTime * 60;
+					
+					vec3.setLength(tmpMoveVec, speed, tmpMoveVec);
+					vec3.rotateX(tmpMoveVec, vec3.create(), camRot[0] * Math.PI / 180, tmpMoveVec)
+					vec3.rotateY(tmpMoveVec, vec3.create(), camRot[1] * Math.PI / 180, tmpMoveVec)
+					
+					vec3.add(camPos, tmpMoveVec, camPos);
+				}
+				
+				//Setup view matrix
+				mat4.identity(viewMat);
+				
+				mat4.translate(viewMat, camPos, viewMat);
+				
+				mat4.rotateY(viewMat, camRot[1] * Math.PI / 180, viewMat);
+				mat4.rotateX(viewMat, camRot[0] * Math.PI / 180, viewMat);
+				
+				mat4.inverse(viewMat, invViewMat)
+				
+				device.queue.writeBuffer(
+					uniformBuffer,
+					0,
+					invViewMat.buffer,
+					invViewMat.byteOffset,
+					invViewMat.byteLength
+				);
+				
+				//Setup projection matrix
+				mat4.perspective(70, canvas.width / canvas.height, 0.0001, 50, projMat);
+				
+				device.queue.writeBuffer(
+					uniformBuffer,
+					16 * 4,
+					projMat.buffer,
+					projMat.byteOffset,
+					projMat.byteLength
+				);
+				
+				device.queue.writeBuffer(
+					uniformBuffer,
+					16 * 4 * 2,
+					camPos.buffer,
+					camPos.byteOffset,
+					camPos.byteLength
+				);
+		
+				//Start physics compute pass
+				const PHYS_STEPS = 20;
+				let gravity = document.getElementById("gravity").checked ? 9.8 : 0;
+				
+				//Fill compute uniforms with initial data
+				physUniArray[0] = timestamp / 1000 - (PHYS_STEPS - 1) * deltaTime / PHYS_STEPS;
+				physUniArray[1] = prevDeltaTime / PHYS_STEPS;
+				physUniArray[2] = deltaTime / PHYS_STEPS;
+				physUniArray[3] = gravity;
+				
+				physUniArray[4] = 0.0005 / document.getElementById("stretchstiff").value;
+				physUniArray[5] = 0.0005 / document.getElementById("bendstiff").value;
+				physUniArrayInt[6] = 
+					(document.getElementById("pinpoint1").checked ? 1 : 0) |
+					(document.getElementById("pinpoint2").checked ? 2 : 0) |
+					(document.getElementById("pinpoint3").checked ? 4 : 0) |
+					(document.getElementById("pinpoint4").checked ? 8 : 0) |
+					(document.getElementById("pinpoint5").checked ? 16 : 0);
+					
+				device.queue.writeBuffer(
+					physUniBuffer,
+					0,
+					physUniArray.buffer,
+					physUniArray.byteOffset,
+					physUniArray.byteLength
+				);
+				
+				for(let i = 0; i < PHYS_STEPS; i++) {
+					if(i > 0) {
+						//Update time uniform
+						physUniArray[0] += deltaTime / PHYS_STEPS;
+						//Replace prev delta time at second step
+						physUniArray[1] = physUniArray[2];
+						
+						device.queue.writeBuffer(
+							physUniBuffer,
+							0,
+							physUniArray.buffer,
+							physUniArray.byteOffset,
+							(i == 1) ? 4 * 2 : 4
+						);
+					}
+					
+					//Dispath physics compute shaders
+					const commandEncoder = device.createCommandEncoder();
+					const computePass = commandEncoder.beginComputePass();
+
+					computePass.setBindGroup(0, physBindGroups[step & 1]);
+					
+					computePass.setPipeline(physAddForcesPipeline);
+					computePass.dispatchWorkgroups(GRID_SIZE / 8, GRID_SIZE / 8);
+					
+					computePass.setPipeline(physResolveConstraintsPipeline);
+					computePass.dispatchWorkgroups(GRID_SIZE / 8, GRID_SIZE / 8);
+					
+					computePass.setPipeline(physUpdateBuffersPipeline);
+					computePass.dispatchWorkgroups(GRID_SIZE / 8, GRID_SIZE / 8);
+					
+					//Recalculate normals at the last step
+					if(i == PHYS_STEPS - 1) {
+						computePass.setPipeline(recalcNormsPipeline);
+						computePass.dispatchWorkgroups(GRID_SIZE / 8, GRID_SIZE / 8);
+					}
+					
+					computePass.end();
+					
+					device.queue.submit([commandEncoder.finish()]);
+					
+					step++;
+				}
+
+				//Start a render pass
+				const commandEncoder = device.createCommandEncoder();
+				
+				const pass = commandEncoder.beginRenderPass({
+					colorAttachments: [{
+						view: renderTexture.createView(),
+						resolveTarget: context.getCurrentTexture().createView(),
+						
+						clearValue: [245 / 255, 245 / 255, 245 / 255, 1],
+						loadOp: "clear",
+						storeOp: "discard",
+					}],
+					
+					depthStencilAttachment: {
+						view: depthTexture.createView(),
+
+						depthClearValue: 1,
+						depthLoadOp: 'clear',
+						depthStoreOp: 'discard',
+					},
+				});
+
+				//Draw cloth
+				pass.setPipeline(renderPipeline);
+				
+				pass.setBindGroup(0, renderBindGroup);
+				
+				pass.setVertexBuffer(0, (step & 1) == 0 ? vtxBuffer : vtxBufferNext);
+				pass.setVertexBuffer(1, normsBuffer);
+				pass.setIndexBuffer(indexBuffer, "uint16");
+				
+				pass.drawIndexed((GRID_SIZE - 1) * (GRID_SIZE - 1) * 2 * 3);
+
+				//End the render pass and submit the command buffer
+				pass.end();
+				device.queue.submit([commandEncoder.finish()]);
+		
+				requestAnimationFrame(frame);
+			}
+		
+			requestAnimationFrame(frame);
+		</script>
+	</body>
+</html>
